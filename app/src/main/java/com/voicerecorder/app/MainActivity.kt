@@ -40,8 +40,6 @@ class MainActivity : AppCompatActivity() {
     private val recordingsList = mutableListOf<Recording>()
     private lateinit var adapter: RecordingAdapter
 
-    private val REQUEST_CODE = 100
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -73,15 +71,17 @@ class MainActivity : AppCompatActivity() {
     private fun checkPermissions() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE)
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
         }
     }
+
+    private fun getPrefs() = getSharedPreferences("recordings_meta", MODE_PRIVATE)
 
     private fun getRecordingsDir() = File(filesDir, "recordings").also { if (!it.exists()) it.mkdirs() }
 
     private fun loadRecordings() {
         recordingsList.clear()
-        val prefs = getSharedPreferences("recordings_meta", MODE_PRIVATE)
+        val prefs = getPrefs()
         getRecordingsDir().listFiles()
             ?.filter { it.extension == "m4a" }
             ?.sortedByDescending { it.lastModified() }
@@ -109,6 +109,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { "00:00" }
     }
 
+    // ===== 录音 =====
     private fun startRecording() {
         val dateStr = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         currentFile = File(getRecordingsDir(), "录音_$dateStr.m4a")
@@ -158,6 +159,7 @@ class MainActivity : AppCompatActivity() {
         }, 100)
     }
 
+    // ===== 播放 =====
     private fun playRecording(recording: Recording) {
         mediaPlayer?.release()
         mediaPlayer = MediaPlayer().apply {
@@ -168,6 +170,7 @@ class MainActivity : AppCompatActivity() {
         adapter.setPlaying(recording.id)
     }
 
+    // ===== 删除 =====
     private fun deleteRecording(recording: Recording) {
         AlertDialog.Builder(this)
             .setTitle("删除录音")
@@ -176,12 +179,21 @@ class MainActivity : AppCompatActivity() {
                 mediaPlayer?.let { if (it.isPlaying) it.stop(); it.release() }
                 mediaPlayer = null
                 File(recording.filePath).delete()
-                getSharedPreferences("recordings_meta", MODE_PRIVATE).edit()
-                    .remove("transcript_${recording.id}").remove("summary_${recording.id}").apply()
+                getPrefs().edit()
+                    .remove("transcript_${recording.id}")
+                    .remove("summary_${recording.id}").apply()
                 loadRecordings()
                 Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("取消", null).show()
+    }
+
+    // ===== 保存文字（同时清除旧总结）=====
+    private fun saveTranscript(recordingId: String, text: String) {
+        getPrefs().edit()
+            .putString("transcript_$recordingId", text)
+            .remove("summary_$recordingId") // ⚠️ 文字变了，必须清除旧总结
+            .apply()
     }
 
     // ===== 讯飞语音转文字 =====
@@ -192,21 +204,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        var progressMsg = "正在上传录音到讯飞服务器...\n预计需要10~30秒，请耐心等待 ⏳"
         val loadingDialog = AlertDialog.Builder(this)
             .setTitle("🎙️ 语音转文字")
-            .setMessage(progressMsg)
-            .setCancelable(false)
-            .create()
+            .setMessage("正在上传录音到讯飞服务器...\n预计需要10~30秒 ⏳")
+            .setCancelable(false).create()
         loadingDialog.show()
 
-        // 定时更新提示
-        val msgs = listOf(
-            8000L to "⏳ 正在识别语音内容...",
-            18000L to "⏳ 识别中，稍候...\n（较长录音需要更多时间）",
-            35000L to "⏳ 还在处理中，请稍候..."
-        )
-        msgs.forEach { (delay, msg) ->
+        val hints = listOf(8000L to "⏳ 识别中，请稍候...", 20000L to "⏳ 还在处理，快好了...")
+        hints.forEach { (delay, msg) ->
             Handler(Looper.getMainLooper()).postDelayed({
                 if (loadingDialog.isShowing) loadingDialog.setMessage(msg)
             }, delay)
@@ -216,15 +221,14 @@ class MainActivity : AppCompatActivity() {
             try {
                 val transcript = IFlytekService.transcribeAudio(file)
                 loadingDialog.dismiss()
-                getSharedPreferences("recordings_meta", MODE_PRIVATE)
-                    .edit().putString("transcript_${recording.id}", transcript).apply()
+                saveTranscript(recording.id, transcript)
                 loadRecordings()
                 showTranscriptResultDialog(recording, transcript)
             } catch (e: Exception) {
                 loadingDialog.dismiss()
                 AlertDialog.Builder(this@MainActivity)
                     .setTitle("❌ 识别失败")
-                    .setMessage("原因：${e.message}\n\n建议：\n• 检查网络连接\n• 确保录音有效\n• 也可手动输入文字")
+                    .setMessage("原因：${e.message}\n\n可手动输入文字后生成AI总结。")
                     .setPositiveButton("手动输入") { _, _ -> showManualInputDialog(recording) }
                     .setNegativeButton("关闭", null).show()
             }
@@ -239,7 +243,7 @@ class MainActivity : AppCompatActivity() {
                 val updated = recordingsList.find { it.id == recording.id }
                 if (updated != null) generateSummary(updated)
             }
-            .setNeutralButton("复制文字") { _, _ -> copyToClipboard(transcript) }
+            .setNeutralButton("复制") { _, _ -> copyToClipboard(transcript) }
             .setNegativeButton("关闭", null).show()
     }
 
@@ -256,10 +260,9 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("保存") { _, _ ->
                 val text = editText.text.toString().trim()
                 if (text.isNotEmpty()) {
-                    getSharedPreferences("recordings_meta", MODE_PRIVATE)
-                        .edit().putString("transcript_${recording.id}", text).apply()
+                    saveTranscript(recording.id, text) // 同时清除旧总结
                     loadRecordings()
-                    Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "已保存，旧总结已清除", Toast.LENGTH_SHORT).show()
                 }
             }
             .setNegativeButton("取消", null).show()
@@ -271,56 +274,53 @@ class MainActivity : AppCompatActivity() {
         if (current.transcript.isNullOrEmpty()) {
             AlertDialog.Builder(this)
                 .setTitle("💡 提示")
-                .setMessage("请先点击「📝 转文字」，将语音内容转为文字后再生成AI总结。")
+                .setMessage("请先点击「📝 转文字」将语音转为文字，再生成AI总结。")
                 .setPositiveButton("去转文字") { _, _ -> transcribeRecording(recording) }
                 .setNegativeButton("取消", null).show()
             return
         }
-        if (current.summary != null) {
-            showSummaryDialog(current.name, current.summary)
-        } else {
-            generateSummary(current)
-        }
+        // 每次都重新生成，确保基于最新文字
+        generateSummary(current)
     }
 
     private fun generateSummary(recording: Recording) {
         val transcript = recording.transcript ?: return
         val loadingDialog = AlertDialog.Builder(this)
             .setTitle("🤖 AI 总结生成中...")
-            .setMessage("正在智能分析内容要点...")
+            .setMessage("正在分析内容要点...")
             .setCancelable(false).create()
         loadingDialog.show()
 
         Handler(Looper.getMainLooper()).postDelayed({
             val summary = buildAiSummary(transcript)
-            getSharedPreferences("recordings_meta", MODE_PRIVATE)
-                .edit().putString("summary_${recording.id}", summary).apply()
+            // 保存最新总结
+            getPrefs().edit().putString("summary_${recording.id}", summary).apply()
             loadingDialog.dismiss()
             loadRecordings()
             showSummaryDialog(recording.name, summary)
-        }, 600)
+        }, 500)
     }
 
     private fun buildAiSummary(text: String): String {
         val cleanText = text.trim()
         val charCount = cleanText.length
-        val sentences = cleanText.split(Regex("[。！？.!?\\n]")).map { it.trim() }.filter { it.length > 4 }
+        val sentences = cleanText.split(Regex("[。！？.!?\\n]")).map { it.trim() }.filter { it.length > 3 }
         val estimatedSecs = (charCount * 0.3).toInt()
-        val durationStr = if (estimatedSecs >= 60) "${estimatedSecs/60}分${estimatedSecs%60}秒" else "${estimatedSecs}秒"
+        val durationStr = if (estimatedSecs >= 60) "${estimatedSecs / 60}分${estimatedSecs % 60}秒" else "${estimatedSecs}秒"
 
         return buildString {
             append("━━━━━━━━━━━━━━━━━━\n")
-            append("🤖  AI 智能总结报告\n")
+            append("🤖  AI 智能总结\n")
             append("━━━━━━━━━━━━━━━━━━\n\n")
             append("📊 基本信息\n")
-            append("字数 $charCount 字 | 句数 ${sentences.size} 句 | 约$durationStr\n\n")
+            append("字数：$charCount 字  句数：${sentences.size} 句  约$durationStr\n\n")
             append("📌 核心内容\n")
             append(extractCoreSummary(sentences, cleanText))
             append("\n\n")
             val keyPoints = extractKeyPoints(sentences)
             if (keyPoints.isNotEmpty()) {
                 append("💡 要点提炼\n")
-                keyPoints.forEachIndexed { i, p -> append("${i+1}. $p\n") }
+                keyPoints.forEachIndexed { i, p -> append("${i + 1}. $p\n") }
                 append("\n")
             }
             val keywords = extractKeywords(cleanText)
@@ -333,30 +333,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractCoreSummary(sentences: List<String>, fullText: String): String {
-        if (sentences.isEmpty()) return "（内容为空）"
+        if (sentences.isEmpty()) return fullText.take(50).ifEmpty { "（内容为空）" }
         return sentences.take(2).joinToString("，") { it.take(35) } +
                 if (fullText.length > 70) "……" else ""
     }
 
     private fun extractKeyPoints(sentences: List<String>): List<String> {
-        val markers = listOf("首先","其次","然后","最后","第一","第二","第三","重要",
-            "注意","需要","应该","建议","总结","关键","主要","因此","所以","结果","但是")
+        val markers = listOf("首先", "其次", "然后", "最后", "第一", "第二", "第三",
+            "重要", "注意", "需要", "应该", "建议", "总结", "关键", "因此", "所以")
         val result = mutableListOf<String>()
         for (s in sentences) {
             if (result.size >= 5) break
-            if (markers.any { s.contains(it) } && s.length >= 8)
+            if (markers.any { s.contains(it) } && s.length >= 6)
                 result.add(if (s.length > 42) s.take(42) + "..." else s)
         }
         if (result.isEmpty() && sentences.size >= 2) {
-            listOf(0, sentences.size/2, sentences.size-1).distinct().forEach { i ->
-                if (result.size < 4 && sentences[i].length >= 8) result.add(sentences[i].take(42))
+            listOf(0, sentences.size / 2, sentences.size - 1).distinct().forEach { i ->
+                if (result.size < 3 && sentences[i].length >= 6) result.add(sentences[i].take(42))
             }
         }
         return result
     }
 
     private fun extractKeywords(text: String): List<String> {
-        val stopWords = setOf("的","了","在","是","我","你","他","她","们","这","那","有","和","也","都","很","就","不","没","会","能","要","一个","这个","那个","什么","怎么","为什么")
+        val stopWords = setOf("的", "了", "在", "是", "我", "你", "他", "她", "们", "这", "那",
+            "有", "和", "也", "都", "很", "就", "不", "没", "会", "能", "要", "一个", "什么")
         val freq = mutableMapOf<String, Int>()
         for (len in 2..4) {
             for (i in 0..text.length - len) {
